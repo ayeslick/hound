@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -37,10 +38,45 @@ class FileInfo:
         return asdict(self)
 
 
+def normalize_patterns(patterns: Iterable[str] | None) -> list[str]:
+    """Normalize include/ignore pattern strings.
+
+    Removes whitespace, leading ``./`` segments, converts path separators to
+    forward slashes, and deduplicates while preserving order. Returns an empty
+    list when ``patterns`` is falsy.
+    """
+
+    if not patterns:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        if pattern is None:
+            continue
+        text = str(pattern).strip()
+        if not text:
+            continue
+        if text.startswith("./"):
+            text = text[2:]
+        text = text.replace("\\", "/")
+        if text and text not in seen:
+            normalized.append(text)
+            seen.add(text)
+    return normalized
+
+
 class RepositoryManifest:
     """Manages repository ingestion and card creation."""
     
-    def __init__(self, repo_path: str, config: dict, file_filter: list[str] | None = None, manual_chunking: bool = False):
+    def __init__(
+        self,
+        repo_path: str,
+        config: dict,
+        file_filter: list[str] | None = None,
+        manual_chunking: bool = False,
+        ignore_patterns: list[str] | None = None,
+    ):
         """Initialize manifest with repository path and config.
         
         Args:
@@ -50,11 +86,15 @@ class RepositoryManifest:
         """
         self.repo_path = Path(repo_path).resolve()
         self.config = config
-        self.file_filter = file_filter  # List of specific files to include
+        # Normalize patterns once for consistent comparisons and manifest reuse
+        self.file_filter = normalize_patterns(file_filter)
+        self.ignore_patterns = normalize_patterns(ignore_patterns)
         self.manual_chunking = manual_chunking
         self.cards: list[Card] = []
         self.files: list[FileInfo] = []
         self.file_extensions = self._get_file_extensions()
+        self._resolved_filter_cache: list[Path] | None = None
+        self._resolved_ignore_cache: tuple[set[str], set[str]] | None = None
         
         # Bundling parameters
         bundle_config = config.get("bundling", {})
@@ -100,12 +140,13 @@ class RepositoryManifest:
         
         # If file_filter is provided, only process those specific files
         if self.file_filter:
-            for file_path_str in self.file_filter:
-                file_path = self.repo_path / file_path_str
-                if file_path.exists() and file_path.is_file():
-                    # Check extension if we have filters
-                    if file_path.suffix in self.file_extensions:
-                        files.append(file_path)
+            for file_path in self._resolve_file_filter():
+                if file_path.suffix not in self.file_extensions:
+                    continue
+                relpath = file_path.relative_to(self.repo_path).as_posix()
+                if self._is_ignored(relpath):
+                    continue
+                files.append(file_path)
             return sorted(files)
         
         # Otherwise, find all source files in repository
@@ -124,12 +165,72 @@ class RepositoryManifest:
             # Skip if in ignored directory
             if any(skip in path.parts for skip in skip_dirs):
                 continue
-            
+
             # Check extension
             if path.suffix in self.file_extensions:
+                relpath = path.relative_to(self.repo_path).as_posix()
+                if self._is_ignored(relpath):
+                    continue
                 files.append(path)
-        
+
         return sorted(files)
+
+    def _resolve_file_filter(self) -> list[Path]:
+        """Resolve include patterns into repository paths."""
+
+        if self._resolved_filter_cache is not None:
+            return self._resolved_filter_cache
+
+        resolved: set[Path] = set()
+        for pattern in self.file_filter:
+            matches = list(self.repo_path.glob(pattern))
+            if not matches:
+                candidate = self.repo_path / pattern
+                if candidate.exists():
+                    matches = [candidate]
+            for match in matches:
+                if match.is_file():
+                    resolved.add(match.resolve())
+
+        self._resolved_filter_cache = sorted(resolved)
+        return self._resolved_filter_cache
+
+    def _is_ignored(self, relpath: str) -> bool:
+        """Return True if a relative path matches an ignore pattern."""
+
+        if not self.ignore_patterns:
+            return False
+
+        resolved_files, resolved_dirs = self._resolve_ignore_patterns()
+        rel = relpath.replace("\\", "/")
+        if rel in resolved_files:
+            return True
+        return any(rel == d or rel.startswith(f"{d}/") for d in resolved_dirs)
+
+    def _resolve_ignore_patterns(self) -> tuple[set[str], set[str]]:
+        """Resolve ignore patterns to sets of files and directories."""
+
+        if self._resolved_ignore_cache is not None:
+            return self._resolved_ignore_cache
+
+        files: set[str] = set()
+        dirs: set[str] = set()
+
+        for pattern in self.ignore_patterns:
+            matches = list(self.repo_path.glob(pattern))
+            if not matches:
+                candidate = self.repo_path / pattern
+                if candidate.exists():
+                    matches = [candidate]
+            for match in matches:
+                rel = match.relative_to(self.repo_path).as_posix()
+                if match.is_dir():
+                    dirs.add(rel)
+                elif match.is_file():
+                    files.add(rel)
+
+        self._resolved_ignore_cache = (files, dirs)
+        return self._resolved_ignore_cache
     
     def _process_file(self, file_path: Path) -> list[Card]:
         """Process a single file into cards."""
@@ -356,7 +457,12 @@ class RepositoryManifest:
                 manifest["whitelist"] = sorted(list(self.file_filter))
             except Exception:
                 pass
-        
+        if self.ignore_patterns:
+            try:
+                manifest["ignore"] = sorted(list(self.ignore_patterns))
+            except Exception:
+                pass
+
         with open(output_dir / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)
         
