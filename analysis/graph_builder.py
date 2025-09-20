@@ -27,14 +27,15 @@ class DynamicNode:
     label: str
     properties: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
-    
+
     # Optional structured fields
     description: str | None = None
     confidence: float = 1.0
     source_refs: list[str] = field(default_factory=list)  # File paths or card IDs
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
     created_by: str = "agent"  # Which agent/pass created this
     iteration: int = 0  # When in the process it was created
-    
+
     # Analysis fields - facts about the system (NOT security issues)
     observations: list[dict[str, Any]] = field(default_factory=list)  # Verified facts, invariants, behaviors
     assumptions: list[dict[str, Any]] = field(default_factory=list)  # Unverified assumptions, constraints
@@ -75,10 +76,62 @@ class KnowledgeGraph:
                 existing_refs = set(existing_node.source_refs)
                 existing_refs.update(node.source_refs)
                 existing_node.source_refs = list(existing_refs)
+            if getattr(node, 'artifacts', None):
+                existing_node.artifacts = self._merge_artifacts(existing_node.artifacts, node.artifacts)
             return False
         self.nodes[node.id] = node
         return True
-    
+
+    @staticmethod
+    def _merge_artifacts(
+        existing: list[dict[str, Any]] | None,
+        new: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Merge artifact lists while preserving card_id uniqueness."""
+
+        if not existing and not new:
+            return []
+
+        merged: list[dict[str, Any]] = []
+        by_card: dict[str, dict[str, Any]] = {}
+
+        def _ingest(item: Any) -> None:
+            if not isinstance(item, dict):
+                # Preserve non-dict entries as-is
+                merged.append(item)
+                return
+
+            card_id = item.get("card_id")
+            if card_id and isinstance(card_id, str):
+                record = by_card.get(card_id)
+                if not record:
+                    record = {"card_id": card_id}
+                    by_card[card_id] = record
+                    merged.append(record)
+                for key, value in item.items():
+                    if key == "card_id":
+                        continue
+                    if value in (None, "", []):
+                        continue
+                    record[key] = value
+            else:
+                # Artifact without card_id - keep but drop null fields
+                cleaned = {k: v for k, v in item.items() if v not in (None, "", [])}
+                merged.append(cleaned)
+
+        for entry in existing or []:
+            _ingest(entry)
+        for entry in new or []:
+            _ingest(entry)
+
+        normalized: list[dict[str, Any]] = []
+        for entry in merged:
+            if isinstance(entry, dict):
+                normalized.append({k: v for k, v in entry.items() if v not in (None, "", [])})
+            else:
+                normalized.append(entry)
+        return normalized
+
     def add_edge(self, edge: DynamicEdge) -> bool:
         """Add an edge. Returns True if edge was actually added (not duplicate)."""
         # Check for duplicate edges (same source, target, and type)
@@ -173,6 +226,26 @@ class Assumption(BaseModel):
     needs_verification: bool = Field(True, description="Whether this needs verification")
 
 
+class ArtifactSpec(BaseModel):
+    """Detailed reference to a code artifact supporting a node."""
+
+    model_config = {"extra": "allow"}
+
+    card_id: str | None = Field(
+        default=None,
+        description="Card ID that evidences this artifact",
+        validation_alias=AliasChoices("card_id", "card", "id"),
+    )
+    relpath: str | None = Field(default=None, description="Relative path to the source file")
+    char_start: int | None = Field(default=None, description="Character offset where the snippet starts")
+    char_end: int | None = Field(default=None, description="Character offset where the snippet ends")
+    line_start: int | None = Field(default=None, description="Start line number for the snippet")
+    line_end: int | None = Field(default=None, description="End line number for the snippet")
+    size_bytes: int | None = Field(default=None, description="File size in bytes")
+    complexity: str | None = Field(default=None, description="Heuristic complexity estimate")
+    language: str | None = Field(default=None, description="Programming language of the artifact")
+
+
 class NodeSpec(BaseModel):
     """Node to add to the graph"""
     model_config = {"extra": "forbid"}
@@ -183,6 +256,11 @@ class NodeSpec(BaseModel):
         default_factory=list,
         description="List of card IDs where this node appears",
         validation_alias=AliasChoices("refs", "Refs", "evidence", "cards"),
+    )
+    artifacts: list[ArtifactSpec] = Field(
+        default_factory=list,
+        description="Detailed metadata about supporting code artifacts",
+        validation_alias=AliasChoices("artifacts", "Artifacts", "artifact_refs"),
     )
 
 
@@ -211,7 +289,12 @@ class NodeUpdate(BaseModel):
     id: str = Field(description="Node ID to update")
     description: str | None = Field(None, description="New description")
     properties: str | None = Field(None, description="JSON string of properties to update")
-    
+    artifacts: list[ArtifactSpec] = Field(
+        default_factory=list,
+        description="Updated artifact metadata for this node",
+        validation_alias=AliasChoices("artifacts", "Artifacts", "artifact_refs"),
+    )
+
     # New observations/assumptions to add
     new_observations: list[Observation] = Field(default_factory=list, description="[LEAVE EMPTY during graph building - only for agent analysis phase]")
     new_assumptions: list[Assumption] = Field(default_factory=list, description="[LEAVE EMPTY during graph building - only for agent analysis phase]")
@@ -279,10 +362,12 @@ class GraphBuilder:
         
         # Knowledge graphs storage
         self.graphs: dict[str, KnowledgeGraph] = {}
-        
+
         # Card storage for later retrieval
         self.card_store: dict[str, dict] = {}
-        
+        self._file_metadata: dict[str, dict[str, Any]] = {}
+        self._file_text_cache: dict[str, str | None] = {}
+
         # Iteration counter
         self.iteration = 0
         # External progress sink
@@ -909,7 +994,10 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
         for node_spec in new_nodes_specs:
             # Parse properties if provided as JSON string
             properties = {}
-            
+
+            source_refs = self._collect_refs(node_spec)
+            artifacts = self._build_artifacts_for_node(node_spec, source_refs)
+
             node = DynamicNode(
                 id=node_spec.id,
                 type=node_spec.type,
@@ -917,7 +1005,8 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
                 properties=properties,
                 description=None,  # No description in compact schema
                 confidence=1.0,  # Default confidence
-                source_refs=node_spec.refs,  # Use shortened field name
+                source_refs=source_refs,
+                artifacts=artifacts,
                 created_by=f"iteration_{self.iteration}",
                 iteration=self.iteration,
                 # Empty security fields since we're focusing on structure
@@ -960,6 +1049,14 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
                         node.properties.update(props)
                     except json.JSONDecodeError:
                         pass
+
+                if getattr(node_update, "artifacts", None):
+                    new_artifacts = [
+                        art.model_dump(exclude_none=True) if hasattr(art, "model_dump") else art
+                        for art in node_update.artifacts or []
+                    ]
+                    if new_artifacts:
+                        node.artifacts = KnowledgeGraph._merge_artifacts(node.artifacts, new_artifacts)
                 
                 # Add new observations and assumptions
                 for obs in node_update.new_observations:
@@ -974,7 +1071,279 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
         except Exception:
             pass
         return nodes_added, edges_added
-    
+
+
+    def _collect_refs(self, node_spec: NodeSpec) -> list[str]:
+        """Combine refs from node spec and explicit artifact metadata."""
+
+        refs: list[str] = []
+        for ref in node_spec.refs or []:
+            if ref is None:
+                continue
+            ref_str = str(ref)
+            if ref_str not in refs:
+                refs.append(ref_str)
+
+        for artifact in getattr(node_spec, "artifacts", []) or []:
+            data = artifact.model_dump() if hasattr(artifact, "model_dump") else artifact
+            if not isinstance(data, dict):
+                continue
+            card_id = data.get("card_id") or data.get("id")
+            if card_id is None:
+                continue
+            card_id_str = str(card_id)
+            if card_id_str not in refs:
+                refs.append(card_id_str)
+
+        return refs
+
+    def _build_artifacts_for_node(self, node_spec: NodeSpec, refs: list[str]) -> list[dict[str, Any]]:
+        """Construct enriched artifact metadata for a node."""
+
+        artifacts_by_id: dict[str, dict[str, Any]] = {}
+
+        provided = getattr(node_spec, "artifacts", []) or []
+        for artifact in provided:
+            raw = artifact.model_dump() if hasattr(artifact, "model_dump") else artifact
+            if not isinstance(raw, dict):
+                continue
+            normalized = self._normalize_artifact_dict(raw)
+            card_id = normalized.get("card_id")
+            if not card_id:
+                continue
+            artifacts_by_id[card_id] = normalized
+
+        for card_id in refs:
+            metadata = self._card_store_metadata(card_id)
+            if card_id in artifacts_by_id:
+                artifacts_by_id[card_id] = self._merge_artifact_metadata(metadata, artifacts_by_id[card_id])
+            else:
+                artifacts_by_id[card_id] = metadata
+
+        for card_id, data in list(artifacts_by_id.items()):
+            if card_id in refs:
+                continue
+            metadata = self._card_store_metadata(card_id)
+            artifacts_by_id[card_id] = self._merge_artifact_metadata(metadata, data)
+
+        ordered_ids: list[str] = []
+        for card_id in refs:
+            if card_id not in ordered_ids:
+                ordered_ids.append(card_id)
+        for card_id in artifacts_by_id.keys():
+            if card_id not in ordered_ids:
+                ordered_ids.append(card_id)
+
+        artifacts: list[dict[str, Any]] = []
+        for card_id in ordered_ids:
+            data = artifacts_by_id.get(card_id)
+            if not data:
+                continue
+            cleaned = {k: v for k, v in data.items() if v not in (None, "", [])}
+            if "card_id" not in cleaned and card_id:
+                cleaned["card_id"] = card_id
+            artifacts.append(cleaned)
+
+        return artifacts
+
+    def _normalize_artifact_dict(self, raw: dict[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        if not isinstance(raw, dict):
+            return normalized
+
+        card_id = raw.get("card_id") or raw.get("id")
+        if card_id:
+            normalized["card_id"] = str(card_id)
+
+        relpath = raw.get("relpath") or raw.get("path")
+        if relpath:
+            normalized["relpath"] = relpath
+
+        for field in ("char_start", "char_end", "line_start", "line_end", "size_bytes"):
+            value = self._safe_int(raw.get(field))
+            if value is not None:
+                normalized[field] = value
+
+        if "size_bytes" not in normalized:
+            size_fallback = self._safe_int(raw.get("size"))
+            if size_fallback is not None:
+                normalized["size_bytes"] = size_fallback
+
+        for field in ("complexity", "language"):
+            value = raw.get(field)
+            if value not in (None, "", []):
+                normalized[field] = value
+
+        for key, value in raw.items():
+            if key in normalized or key in {"id", "path", "size"}:
+                continue
+            if value in (None, "", []):
+                continue
+            normalized[key] = value
+
+        return normalized
+
+    def _merge_artifact_metadata(
+        self,
+        base: dict[str, Any],
+        override: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+        for key, value in (base or {}).items():
+            if value in (None, "", []):
+                continue
+            merged[key] = value
+        for key, value in (override or {}).items():
+            if value in (None, "", []):
+                continue
+            merged[key] = value
+        if "card_id" not in merged:
+            cid = (override or {}).get("card_id") or (base or {}).get("card_id")
+            if cid:
+                merged["card_id"] = cid
+        return merged
+
+    def _card_store_metadata(self, card_id: str) -> dict[str, Any]:
+        metadata: dict[str, Any] = {"card_id": card_id}
+        card = self.card_store.get(card_id)
+        if not isinstance(card, dict):
+            return metadata
+
+        relpath = card.get("relpath") or card.get("path")
+        if relpath:
+            metadata["relpath"] = relpath
+
+        char_start = self._safe_int(card.get("char_start"))
+        char_end = self._safe_int(card.get("char_end"))
+        if char_start is not None:
+            metadata["char_start"] = char_start
+        if char_end is not None:
+            metadata["char_end"] = char_end
+
+        line_start, line_end = self._resolve_line_span(card)
+        if line_start is not None:
+            metadata["line_start"] = line_start
+        if line_end is not None:
+            metadata["line_end"] = line_end
+
+        file_info: dict[str, Any] | None = None
+        if relpath and self._file_metadata:
+            file_info = self._file_metadata.get(relpath)
+            if isinstance(file_info, dict):
+                size_val = self._safe_int(file_info.get("size")) or self._safe_int(file_info.get("size_bytes"))
+                if size_val is not None:
+                    metadata["size_bytes"] = size_val
+                language = file_info.get("language")
+                if language:
+                    metadata["language"] = language
+
+        complexity = self._estimate_complexity(card, file_info)
+        if complexity:
+            metadata["complexity"] = complexity
+
+        return metadata
+
+    def _resolve_line_span(self, card: dict[str, Any]) -> tuple[int | None, int | None]:
+        line_start = card.get("line_start")
+        line_end = card.get("line_end")
+        if isinstance(line_start, int) and isinstance(line_end, int):
+            return line_start, line_end
+
+        relpath = card.get("relpath") or card.get("path")
+        char_start = self._safe_int(card.get("char_start"))
+        char_end = self._safe_int(card.get("char_end"))
+
+        if relpath and char_start is not None and char_end is not None and char_end >= char_start:
+            text = self._get_file_text(relpath)
+            if text is not None:
+                start_line = text.count("\n", 0, char_start) + 1
+                end_line = text.count("\n", 0, min(len(text), char_end)) + 1
+                if end_line < start_line:
+                    end_line = start_line
+                return start_line, end_line
+
+        return (
+            line_start if isinstance(line_start, int) else None,
+            line_end if isinstance(line_end, int) else None,
+        )
+
+    def _estimate_complexity(
+        self,
+        card: dict[str, Any],
+        file_info: dict[str, Any] | None,
+    ) -> str | None:
+        try:
+            line_count: int | None = None
+            if isinstance(card.get("line_end"), int) and isinstance(card.get("line_start"), int):
+                line_count = max(1, card["line_end"] - card["line_start"] + 1)
+            if line_count is None:
+                content = card.get("content")
+                if isinstance(content, str) and content:
+                    line_count = content.count("\n") + 1
+            if line_count is None:
+                char_start = self._safe_int(card.get("char_start"))
+                char_end = self._safe_int(card.get("char_end"))
+                if char_start is not None and char_end is not None and char_end > char_start:
+                    approx = char_end - char_start
+                    line_count = max(1, approx // 40)
+
+            size_bytes = None
+            if file_info:
+                size_bytes = self._safe_int(file_info.get("size")) or self._safe_int(file_info.get("size_bytes"))
+            if size_bytes is None:
+                char_start = self._safe_int(card.get("char_start"))
+                char_end = self._safe_int(card.get("char_end"))
+                if char_start is not None and char_end is not None and char_end > char_start:
+                    size_bytes = char_end - char_start
+
+            metric = 0
+            if line_count is not None:
+                metric = max(metric, line_count)
+            if size_bytes is not None:
+                metric = max(metric, size_bytes // 80)
+
+            if metric >= 200 or (size_bytes is not None and size_bytes >= 15000):
+                return "high"
+            if metric >= 80 or (size_bytes is not None and size_bytes >= 6000):
+                return "medium"
+            if metric > 0:
+                return "low"
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value != value:  # NaN
+                return None
+            return int(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return int(float(text))
+            except ValueError:
+                return None
+        return None
+
+    def _get_file_text(self, relpath: str | None) -> str | None:
+        if not relpath or not self._repo_root:
+            return None
+        if relpath in self._file_text_cache:
+            return self._file_text_cache[relpath]
+        try:
+            text = (self._repo_root / relpath).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            text = None
+        self._file_text_cache[relpath] = text
+        return text
+
     
     @staticmethod
     def load_cards_from_manifest(manifest_dir: Path) -> tuple[list[dict], dict]:
@@ -1257,13 +1626,17 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
         
         with open(manifest_dir / "manifest.json") as f:
             manifest = json.load(f)
-        
+
         repo_path = manifest.get('repo_path')
         if repo_path:
             self._repo_root = Path(repo_path)
-        
+
+        # Reset caches tied to the manifest
+        self._file_metadata = self._load_file_metadata(manifest_dir)
+        self._file_text_cache = {}
+
         from .cards import extract_card_content
-        
+
         cards = []
         with open(manifest_dir / "cards.jsonl") as f:
             for line in f:
@@ -1271,8 +1644,27 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
                 if not card.get('content') and self._repo_root:
                     card['content'] = extract_card_content(card, self._repo_root)
                 cards.append(card)
-        
+
         return manifest, cards
+
+    def _load_file_metadata(self, manifest_dir: Path) -> dict[str, dict[str, Any]]:
+        file_metadata: dict[str, dict[str, Any]] = {}
+        files_json = manifest_dir / "files.json"
+        if not files_json.exists():
+            return file_metadata
+        try:
+            with open(files_json) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                for entry in data:
+                    if not isinstance(entry, dict):
+                        continue
+                    relpath = entry.get("relpath") or entry.get("path")
+                    if relpath:
+                        file_metadata[str(relpath)] = entry
+        except Exception:
+            return file_metadata
+        return file_metadata
     
     def _save_results(self, output_dir: Path, manifest: dict) -> dict:
         """Save all graphs and analysis results"""
@@ -1294,6 +1686,11 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
         for graph in self.graphs.values():
             for node in graph.nodes.values():
                 all_card_ids.update(node.source_refs)
+                for artifact in node.artifacts or []:
+                    if isinstance(artifact, dict):
+                        cid = artifact.get("card_id")
+                        if cid:
+                            all_card_ids.add(str(cid))
             for edge in graph.edges.values():
                 if hasattr(edge, 'evidence') and edge.evidence:
                     all_card_ids.update(edge.evidence)
@@ -1365,7 +1762,10 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
                 kg = KnowledgeGraph(name=name, focus=focus, metadata=data.get("metadata") or {})
                 for nd in data.get("nodes", []) or []:
                     try:
-                        kg.nodes[nd.get("id") or "unknown"] = DynamicNode(**nd)
+                        node_data = dict(nd)
+                        if not isinstance(node_data.get("artifacts"), list):
+                            node_data["artifacts"] = []
+                        kg.nodes[node_data.get("id") or "unknown"] = DynamicNode(**node_data)
                     except Exception:
                         continue
                 for ed in data.get("edges", []) or []:
