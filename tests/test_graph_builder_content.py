@@ -148,22 +148,38 @@ class TestGraphBuilderContentLoading(unittest.TestCase):
             max_iterations=1,
             max_graphs=1
         )
-        
+
         # Verify that the full content was loaded and passed to LLM
         self.assertTrue(len(seen_content) > 0, "No content was passed to LLM")
-        
+
         # Check that we got the FULL content, not just the peeks
         for content in seen_content:
             if content:  # Skip empty content
                 # The full content should include middle lines that aren't in peek_head or peek_tail
-                self.assertIn("# This is line 10", content, 
+                self.assertIn("# This is line 10", content,
                              "Middle content missing - only peek_head/tail was used!")
                 self.assertIn("# This is line 15", content,
                              "Middle content missing - only peek_head/tail was used!")
-                
+
                 # Verify it's the complete content
                 self.assertEqual(content.strip(), self.full_content.strip(),
                                "Content doesn't match the full file content")
+
+        # Verify artifact metadata is populated in the saved graph
+        graph_files = list(self.output_dir.glob("graph_*.json"))
+        self.assertTrue(graph_files, "No graph files were produced")
+        with open(graph_files[0]) as f:
+            graph_data = json.load(f)
+        nodes = graph_data.get("nodes", [])
+        self.assertTrue(nodes, "Graph has no nodes")
+        node = nodes[0]
+        artifacts = node.get("artifacts")
+        self.assertIsInstance(artifacts, list)
+        self.assertTrue(artifacts, "Node missing artifact metadata")
+        artifact = artifacts[0]
+        self.assertEqual(artifact.get("card_id"), "card_0")
+        self.assertEqual(artifact.get("relpath"), "test.py")
+        self.assertIn("line_start", artifact)
     
     def test_extract_card_content_directly(self):
         """Test the extract_card_content function directly."""
