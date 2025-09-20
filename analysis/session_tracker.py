@@ -346,30 +346,86 @@ class SessionTracker:
             self.coverage.add_node(node_id)
             self._save()
     
-    def track_card_visit(self, card_path: str):
+    def _record_card_visit(self, card_ref: str | Path | None):
+        """Internal helper to record a card visit without touching the lock."""
+
+        if not card_ref:
+            return
+
+        try:
+            ref_str = str(card_ref)
+        except Exception:
+            ref_str = card_ref  # type: ignore[assignment]
+
+        if not ref_str:
+            return
+
+        ids: list[str] = []
+        mapping = getattr(self, '_file_to_cards', None)
+        if isinstance(mapping, dict):
+            normalized = ref_str.replace('\\', '/').strip()
+            candidates: list[str] = []
+
+            def _add_candidate(value: str | None):
+                if not value:
+                    return
+                sval = str(value)
+                if not sval:
+                    return
+                if sval not in candidates:
+                    candidates.append(sval)
+
+            _add_candidate(normalized)
+            _add_candidate(normalized.lstrip('/'))
+            _add_candidate(normalized.lstrip('./'))
+            try:
+                path_obj = Path(ref_str)
+                _add_candidate(path_obj.as_posix())
+                if path_obj.is_absolute():
+                    _add_candidate(path_obj.name)
+                    # Try to match by suffix against stored keys
+                    suffix = path_obj.as_posix().lstrip('/')
+                    _add_candidate(suffix)
+            except Exception:
+                pass
+
+            for cand in candidates:
+                matches = mapping.get(cand)
+                if matches:
+                    ids = [str(x) for x in matches if x]
+                    if ids:
+                        break
+
+            if not ids:
+                # Fall back to suffix matching if direct lookup failed
+                for stored_key, stored_ids in mapping.items():
+                    if not stored_key:
+                        continue
+                    try:
+                        key_str = str(stored_key)
+                    except Exception:
+                        continue
+                    key_norm = key_str.replace('\\', '/')
+                    if normalized.endswith(key_norm) or key_norm.endswith(normalized):
+                        if stored_ids:
+                            ids = [str(x) for x in stored_ids if x]
+                            if ids:
+                                break
+
+        if not ids and ref_str in getattr(self.coverage, 'known_card_ids', set()):
+            ids = [ref_str]
+
+        if ids:
+            for cid in ids:
+                self.coverage.add_card(cid)
+        else:
+            # Fall back to recording the reference string
+            self.coverage.add_card(ref_str)
+
+    def track_card_visit(self, card_path: str | Path):
         """Track that a code card was analyzed."""
         with self.lock:
-            # Try to map file path to card IDs for accurate card coverage
-            ids: list[str] = []
-            try:
-                # Normalize path to relpath if possible
-                rel = card_path
-                # If the provided path is absolute or has prefixes, try to use as-is in mapping first
-                if hasattr(self, '_file_to_cards'):
-                    if rel in self._file_to_cards:
-                        ids = list(self._file_to_cards.get(rel, []))
-                    else:
-                        # Try stripping leading slashes
-                        rel2 = rel.lstrip('/')
-                        ids = list(self._file_to_cards.get(rel2, []))
-            except Exception:
-                ids = []
-            if ids:
-                for cid in ids:
-                    self.coverage.add_card(cid)
-            else:
-                # Fall back to recording the path (won't count toward known cards)
-                self.coverage.add_card(card_path)
+            self._record_card_visit(card_path)
             self._save()
     
     def track_nodes_batch(self, node_ids: list[str]):
@@ -379,11 +435,11 @@ class SessionTracker:
                 self.coverage.add_node(node_id)
             self._save()
     
-    def track_cards_batch(self, card_paths: list[str]):
+    def track_cards_batch(self, card_paths: list[str | Path]):
         """Track multiple cards analyzed at once."""
         with self.lock:
             for card_path in card_paths:
-                self.coverage.add_card(card_path)
+                self._record_card_visit(card_path)
             self._save()
     
     def add_investigation(self, investigation: dict[str, Any]):
