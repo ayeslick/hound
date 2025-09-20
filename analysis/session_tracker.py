@@ -11,6 +11,7 @@ from typing import Any
 @dataclass
 class SessionCoverage:
     """Track coverage statistics for a session."""
+
     visited_nodes: set[str] = field(default_factory=set)
     visited_cards: set[str] = field(default_factory=set)
     total_nodes: int = 0
@@ -21,6 +22,10 @@ class SessionCoverage:
     # Known IDs to bound coverage
     known_node_ids: set[str] = field(default_factory=set)
     known_card_ids: set[str] = field(default_factory=set)
+    # Node → cards mapping harvested from knowledge graphs
+    node_card_map: dict[str, set[str]] = field(default_factory=dict)
+    # Node → primary graph mapping for focus area annotations
+    node_graph_map: dict[str, str] = field(default_factory=dict)
     
     def add_node(self, node_id: str):
         """Mark a node as visited."""
@@ -31,7 +36,33 @@ class SessionCoverage:
         """Mark a card as visited."""
         self.visited_cards.add(card_id)
         self.card_visit_counts[card_id] = int(self.card_visit_counts.get(card_id, 0)) + 1
-    
+
+    def register_node_cards(self, node_id: str, card_ids: set[str] | list[str] | tuple[str, ...], graph: str | None = None):
+        """Associate cards with a node for card-aware coverage metrics."""
+
+        if not node_id:
+            return
+
+        if graph:
+            try:
+                self.node_graph_map.setdefault(str(node_id), str(graph))
+            except Exception:
+                pass
+
+        if not card_ids:
+            # Still ensure the node is tracked for graph mapping even if no cards
+            self.node_card_map.setdefault(str(node_id), set())
+            return
+
+        target = self.node_card_map.setdefault(str(node_id), set())
+        for cid in card_ids:
+            if not cid:
+                continue
+            try:
+                target.add(str(cid))
+            except Exception:
+                continue
+
     def get_stats(self) -> dict[str, Any]:
         """Get coverage statistics bounded to known IDs to avoid >100%."""
         # Default totals
@@ -44,6 +75,38 @@ class SessionCoverage:
         def pct(a: int, b: int) -> float:
             return round((a / b * 100.0) if b else 0.0, 1)
         
+        node_card_summary: list[dict[str, Any]] = []
+        visited_cards_set = set(self.visited_cards)
+        all_nodes = set(self.node_graph_map.keys()) | set(self.node_card_map.keys())
+
+        for node_id in sorted(all_nodes):
+            cards_for_node = self.node_card_map.get(node_id, set())
+            if not isinstance(cards_for_node, set):
+                cards_for_node = set(cards_for_node or [])
+            total_cards = len(cards_for_node)
+            visited_cards = len(cards_for_node & visited_cards_set)
+            unvisited_cards = max(total_cards - visited_cards, 0)
+            coverage_percent = pct(visited_cards, total_cards) if total_cards else (100.0 if node_id in self.visited_nodes else 0.0)
+            node_card_summary.append({
+                'node_id': node_id,
+                'graph': self.node_graph_map.get(node_id),
+                'total_cards': total_cards,
+                'visited_cards': visited_cards,
+                'unvisited_cards': unvisited_cards,
+                'coverage_percent': coverage_percent,
+                'visit_count': int(self.node_visit_counts.get(node_id, 0)),
+            })
+
+        # Sort summary by coverage gaps (largest remaining card count first)
+        node_card_summary.sort(key=lambda x: (x['unvisited_cards'], x['total_cards'], -x['coverage_percent']), reverse=True)
+
+        top_unvisited_nodes = [entry for entry in node_card_summary if entry['unvisited_cards'] > 0]
+        fully_covered_nodes = [
+            entry for entry in node_card_summary
+            if entry['total_cards'] > 0 and entry['unvisited_cards'] == 0
+        ]
+        fully_covered_nodes.sort(key=lambda x: (x['total_cards'], -x['visit_count']), reverse=True)
+
         return {
             'nodes': {
                 'visited': nodes_visited,
@@ -57,7 +120,12 @@ class SessionCoverage:
             },
             'visited_node_ids': list(self.visited_nodes),
             'visited_card_ids': list(self.visited_cards),
-            'node_visit_counts': dict(self.node_visit_counts)
+            'node_visit_counts': dict(self.node_visit_counts),
+            'node_card_summary': node_card_summary,
+            'top_unvisited_nodes': top_unvisited_nodes[:20],
+            'fully_covered_nodes': fully_covered_nodes[:20],
+            'node_card_map': {node: sorted(list(cards)) for node, cards in self.node_card_map.items()},
+            'node_graph_map': dict(self.node_graph_map),
         }
 
 
@@ -87,6 +155,22 @@ class SessionTracker:
             self.coverage.visited_cards = set(cov_data.get('visited_card_ids', []))
             self.coverage.total_nodes = cov_data.get('nodes', {}).get('total', 0)
             self.coverage.total_cards = cov_data.get('cards', {}).get('total', 0)
+            node_card_map = cov_data.get('node_card_map', {})
+            if isinstance(node_card_map, dict):
+                rebuilt: dict[str, set[str]] = {}
+                for node_id, card_list in node_card_map.items():
+                    try:
+                        rebuilt[str(node_id)] = {str(cid) for cid in (card_list or []) if cid}
+                    except Exception:
+                        continue
+                if rebuilt:
+                    self.coverage.node_card_map = rebuilt
+            node_graph_map = cov_data.get('node_graph_map', {})
+            if isinstance(node_graph_map, dict):
+                try:
+                    self.coverage.node_graph_map = {str(k): str(v) for k, v in node_graph_map.items() if v is not None}
+                except Exception:
+                    pass
     
     def _load_or_init(self) -> dict[str, Any]:
         """Load existing session or initialize new one."""
@@ -126,6 +210,54 @@ class SessionTracker:
             graphs_dir: Directory containing graph files
             manifest_dir: Directory containing manifest files
         """
+        # Reset derived metadata so stale entries from previous runs are cleared
+        self.coverage.node_card_map = {}
+        self.coverage.node_graph_map = {}
+        self.coverage.known_node_ids = set()
+        self.coverage.known_card_ids = set()
+
+        def _cards_from_node(node: dict[str, Any]) -> set[str]:
+            """Extract card identifiers referenced by a graph node."""
+
+            card_ids: set[str] = set()
+
+            if isinstance(node, dict):
+                for key in ('source_refs', 'refs'):
+                    refs = node.get(key)
+                    if isinstance(refs, list):
+                        for ref in refs:
+                            if isinstance(ref, str):
+                                card_ids.add(ref)
+                            elif isinstance(ref, dict):
+                                for cand in ('card_id', 'id', 'ref'):
+                                    val = ref.get(cand)
+                                    if isinstance(val, str):
+                                        card_ids.add(val)
+
+                cards_field = node.get('cards')
+                if isinstance(cards_field, list):
+                    for entry in cards_field:
+                        if isinstance(entry, dict):
+                            for cand in ('card_id', 'id'):
+                                val = entry.get(cand)
+                                if isinstance(val, str):
+                                    card_ids.add(val)
+
+                artifacts = node.get('artifacts')
+                if isinstance(artifacts, list):
+                    for art in artifacts:
+                        if not isinstance(art, dict):
+                            continue
+                        art_type = str(art.get('type', '')).lower()
+                        if art_type and all(tok not in art_type for tok in ('code', 'card', 'source')):
+                            continue
+                        for cand in ('card_id', 'id', 'ref'):
+                            val = art.get(cand)
+                            if isinstance(val, str):
+                                card_ids.add(val)
+
+            return {str(cid) for cid in card_ids if cid}
+
         # Count nodes from graphs and record known IDs
         total_nodes = 0
         if graphs_dir.exists():
@@ -134,11 +266,26 @@ class SessionTracker:
                     with open(graph_file) as f:
                         graph_data = json.load(f)
                         nodes = graph_data.get('nodes', [])
+                        graph_name = (
+                            graph_data.get('name')
+                            or graph_data.get('internal_name')
+                            or graph_file.stem.replace('graph_', '')
+                        )
                         total_nodes += len(nodes)
                         for n in nodes or []:
                             nid = n.get('id')
                             if nid is not None:
-                                self.coverage.known_node_ids.add(str(nid))
+                                sid = str(nid)
+                                self.coverage.known_node_ids.add(sid)
+                                node_cards = _cards_from_node(n)
+                                if node_cards:
+                                    for cid in node_cards:
+                                        self.coverage.known_card_ids.add(str(cid))
+                                self.coverage.register_node_cards(sid, node_cards, graph_name)
+                            else:
+                                label = n.get('label') if isinstance(n, dict) else None
+                                if isinstance(label, str) and label:
+                                    self.coverage.register_node_cards(label, set(), graph_name)
                 except Exception:
                     pass
         

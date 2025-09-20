@@ -1,5 +1,11 @@
 
-from analysis.strategist import HypothesisBatchJSON, HypothesisItemJSON, Strategist
+from analysis.strategist import (
+    HypothesisBatchJSON,
+    HypothesisItemJSON,
+    PlanBatch,
+    PlanItemSchema,
+    Strategist,
+)
 
 
 class _StubUnified:
@@ -42,6 +48,102 @@ def _context_with_nodes(node_ids: list[str]) -> str:
     lines.append('=== LOADED NODES (CACHE — DO NOT RELOAD) ===')
     lines.append('  ' + ', '.join(node_ids))
     return '\n'.join(lines)
+
+
+def test_plan_next_injects_card_aware_top_up_in_saliency():
+    plan = PlanBatch(
+        investigations=[
+            PlanItemSchema(
+                goal='Investigate suspected overflow',
+                focus_areas=['contract_Treasury@SystemArchitecture'],
+                priority=8,
+                reasoning='LLM suggestion',
+                category='suspicion',
+                expected_impact='high',
+            )
+        ]
+    )
+
+    config = {'models': {'agent': {'model': 'mock', 'provider': 'mock'}}}
+    strategist = Strategist(config=config, debug=False)
+    strategist.llm = _StubLLM(parse_obj=plan)
+
+    coverage_data = {
+        'top_unvisited_nodes': [
+            {
+                'node_id': 'contract_Vault',
+                'graph': 'SystemArchitecture',
+                'total_cards': 12,
+                'visited_cards': 6,
+                'unvisited_cards': 6,
+                'coverage_percent': 50.0,
+            }
+        ],
+        'node_graph_map': {'contract_Vault': 'SystemArchitecture'},
+    }
+
+    items = strategist.plan_next(
+        graphs_summary='graphs',
+        completed=[],
+        n=2,
+        hypotheses_summary='none',
+        coverage_summary='summary',
+        phase_hint='Saliency',
+        coverage_data=coverage_data,
+    )
+
+    assert len(items) == 2
+    coverage_item = items[0]
+    assert 'Coverage top-up' in coverage_item['goal']
+    assert coverage_item['focus_areas'] == ['contract_Vault@SystemArchitecture']
+    assert coverage_item['category'] == 'aspect'
+    assert coverage_item['priority'] >= 7
+
+
+def test_plan_next_skips_top_up_outside_saliency():
+    plan = PlanBatch(
+        investigations=[
+            PlanItemSchema(
+                goal='Investigate suspected overflow',
+                focus_areas=['contract_Treasury@SystemArchitecture'],
+                priority=8,
+                reasoning='LLM suggestion',
+                category='suspicion',
+                expected_impact='high',
+            )
+        ]
+    )
+
+    config = {'models': {'agent': {'model': 'mock', 'provider': 'mock'}}}
+    strategist = Strategist(config=config, debug=False)
+    strategist.llm = _StubLLM(parse_obj=plan)
+
+    coverage_data = {
+        'top_unvisited_nodes': [
+            {
+                'node_id': 'contract_Vault',
+                'graph': 'SystemArchitecture',
+                'total_cards': 12,
+                'visited_cards': 6,
+                'unvisited_cards': 6,
+                'coverage_percent': 50.0,
+            }
+        ],
+        'node_graph_map': {'contract_Vault': 'SystemArchitecture'},
+    }
+
+    items = strategist.plan_next(
+        graphs_summary='graphs',
+        completed=[],
+        n=1,
+        hypotheses_summary='none',
+        coverage_summary='summary',
+        phase_hint='Coverage',
+        coverage_data=coverage_data,
+    )
+
+    assert len(items) == 1
+    assert 'Coverage top-up' not in items[0]['goal']
 
 
 def test_deep_think_json_parsing_success():
