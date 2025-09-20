@@ -23,7 +23,7 @@ import random
 from analysis.debug_logger import DebugLogger
 from analysis.graph_builder import GraphBuilder
 from ingest.bundles import AdaptiveBundler
-from ingest.manifest import RepositoryManifest
+from ingest.manifest import RepositoryManifest, normalize_patterns
 from llm.client import LLMClient
 from llm.token_tracker import get_token_tracker
 from visualization.dynamic_graph_viz import generate_dynamic_visualization
@@ -32,6 +32,17 @@ console = Console()
 # Progress console writes to stderr; auto-detect TTY so interactive shells
 # show progress bars, while non-TTY (benchmarks/pipes) suppress animations.
 progress_console = Console(file=sys.stderr)
+
+
+def _parse_pattern_option(option_value: str | None) -> list[str] | None:
+    """Parse a comma-separated pattern option into normalized values."""
+
+    if not option_value:
+        return None
+
+    raw_parts = [part.strip() for part in option_value.split(",") if part.strip()]
+    patterns = normalize_patterns(raw_parts)
+    return patterns or None
 
 
 def load_config(config_path: Path | None = None) -> dict:
@@ -53,7 +64,8 @@ def build(
     max_iterations: int = typer.Option(3, "--iterations", "-i", help="Maximum iterations"),
     max_graphs: int = typer.Option(5, "--graphs", "-g", help="Number of graphs"),
     focus_areas: str | None = typer.Option(None, "--focus", "-f", help="Focus areas"),
-    file_filter: str | None = typer.Option(None, "--files", help="Comma-separated whitelist of files relative to repo root"),
+    file_filter: str | None = typer.Option(None, "--files", help="Comma-separated whitelist of files relative to repo root (supports glob patterns)"),
+    ignore_filter: str | None = typer.Option(None, "--ignore", help="Comma-separated glob patterns to exclude from ingestion"),
     # New: --with-spec replaces --graph-spec (deprecated)
     with_spec: str | None = typer.Option(None, "--with-spec", help="Build exactly one graph described by this text (skips discovery for others)"),
     graph_spec: str | None = typer.Option(None, "--graph-spec", help="[Deprecated] Same as --with-spec"),
@@ -170,10 +182,14 @@ def build(
             debug_out = None
         debug_logger = DebugLogger(session_id=f"graph_{repo_name}_{int(time.time())}", output_dir=debug_out)
     
+    files_to_include = _parse_pattern_option(file_filter)
+    ignore_patterns = _parse_pattern_option(ignore_filter)
+
     try:
-        files_to_include = [f.strip() for f in file_filter.split(",")] if file_filter else None
         if files_to_include and debug:
-            console.print(f"[dim]File filter: {len(files_to_include)} specific files[/dim]")
+            console.print(f"[dim]File filter patterns: {len(files_to_include)}[/dim]")
+        if ignore_patterns and debug:
+            console.print(f"[dim]Ignore patterns: {len(ignore_patterns)}[/dim]")
         
         # Prepare unified live event log (consistent with agent UI)
         from rich.live import Live
@@ -220,14 +236,40 @@ def build(
                 try:
                     from analysis.graph_builder import GraphBuilder as _GB
                     cards_loaded, manifest_loaded = _GB.load_cards_from_manifest(manifest_dir)
-                    mwl = set((manifest_loaded or {}).get('whitelist') or [])
+                    manifest_data = manifest_loaded or {}
+                    mwl = set(normalize_patterns(manifest_data.get('whitelist') or []))
+                    mignore = set(normalize_patterns(manifest_data.get('ignore') or []))
                     fwl = set(files_to_include or [])
-                    if files_to_include is not None and mwl and mwl != fwl:
-                        # Provided whitelist differs from stored one; rebuild ingestion
+                    fig = set(ignore_patterns or [])
+
+                    if files_to_include is not None:
+                        if mwl != fwl:
+                            # Provided whitelist differs from stored one; rebuild ingestion
+                            reuse_ok = False
+                    elif mwl:
                         reuse_ok = False
-                    else:
-                        wl_note = f" (whitelist: {len(mwl)} files)" if mwl else ""
-                        log_line('ingest', f"Reusing existing manifest: {manifest_loaded.get('num_files','?')} files → {len(cards_loaded)} cards{wl_note}")
+
+                    if ignore_patterns is not None:
+                        if mignore != fig:
+                            reuse_ok = False
+                    elif mignore:
+                        reuse_ok = False
+
+                    if reuse_ok:
+                        note_parts: list[str] = []
+                        if mwl:
+                            note_parts.append(
+                                f"whitelist: {len(mwl)} pattern{'s' if len(mwl) != 1 else ''}"
+                            )
+                        if mignore:
+                            note_parts.append(
+                                f"ignore: {len(mignore)} pattern{'s' if len(mignore) != 1 else ''}"
+                            )
+                        wl_note = f" ({'; '.join(note_parts)})" if note_parts else ""
+                        log_line(
+                            'ingest',
+                            f"Reusing existing manifest: {manifest_data.get('num_files','?')} files → {len(cards_loaded)} cards{wl_note}"
+                        )
                 except Exception:
                     reuse_ok = False
             if not reuse_ok:
@@ -237,7 +279,12 @@ def build(
                     manifest_dir.mkdir(parents=True, exist_ok=True)
                 except Exception:
                     pass
-                manifest = RepositoryManifest(str(repo_path), config, file_filter=files_to_include)
+                manifest = RepositoryManifest(
+                    str(repo_path),
+                    config,
+                    file_filter=files_to_include,
+                    ignore_patterns=ignore_patterns,
+                )
                 cards, files = manifest.walk_repository()
                 manifest.save_manifest(manifest_dir)
                 log_line('ingest', f"Ingested {len(files)} files → {len(cards)} cards")
@@ -521,6 +568,7 @@ def custom(
     config_path: Path | None = None,
     iterations: int = 3,
     file_filter: str | None = None,
+    ignore_filter: str | None = None,
     reuse_ingestion: bool = True,
     debug: bool = False,
     quiet: bool = False,
@@ -552,7 +600,8 @@ def custom(
         box=box.ROUNDED
     ))
 
-    files_to_include = [f.strip() for f in (file_filter or '').split(',')] if file_filter else None
+    files_to_include = _parse_pattern_option(file_filter)
+    ignore_patterns = _parse_pattern_option(ignore_filter)
 
     # Ingestion reuse (with whitelist compatibility)
     reuse_ok = reuse_ingestion and (manifest_dir / 'manifest.json').exists() and (manifest_dir / 'cards.jsonl').exists()
@@ -560,18 +609,35 @@ def custom(
         try:
             from analysis.graph_builder import GraphBuilder as _GB
             cards_loaded, manifest_loaded = _GB.load_cards_from_manifest(manifest_dir)
-            mwl = set((manifest_loaded or {}).get('whitelist') or [])
+            manifest_data = manifest_loaded or {}
+            mwl = set(normalize_patterns(manifest_data.get('whitelist') or []))
+            mignore = set(normalize_patterns(manifest_data.get('ignore') or []))
             fwl = set(files_to_include or [])
-            if files_to_include is not None and mwl and mwl != fwl:
+            fig = set(ignore_patterns or [])
+            if files_to_include is not None:
+                if mwl != fwl:
+                    reuse_ok = False
+            elif mwl:
                 reuse_ok = False
-            else:
-                wl_note = f" (whitelist: {len(mwl)} files)" if mwl else ""
-                console.print(f"[dim]Reusing existing manifest: {manifest_loaded.get('num_files','?')} files → {len(cards_loaded)} cards{wl_note}[/dim]")
+
+            if ignore_patterns is not None:
+                if mignore != fig:
+                    reuse_ok = False
+            elif mignore:
+                reuse_ok = False
+
+            if reuse_ok:
+                note_parts: list[str] = []
+                if mwl:
+                    note_parts.append(f"whitelist: {len(mwl)} pattern{'s' if len(mwl) != 1 else ''}")
+                if mignore:
+                    note_parts.append(f"ignore: {len(mignore)} pattern{'s' if len(mignore) != 1 else ''}")
+                wl_note = f" ({'; '.join(note_parts)})" if note_parts else ""
+                console.print(f"[dim]Reusing existing manifest: {manifest_data.get('num_files','?')} files → {len(cards_loaded)} cards{wl_note}[/dim]")
         except Exception:
             reuse_ok = False
     if not reuse_ok:
         from ingest.bundles import AdaptiveBundler
-        from ingest.manifest import RepositoryManifest
         # Load repo path from project.json
         try:
             with open(project_dir / 'project.json') as f:
@@ -581,7 +647,12 @@ def custom(
             console.print(f"[red]Error: failed to load project configuration: {e}[/red]")
             raise typer.Exit(2)
         console.print("[bold]Step 1:[/bold] Repository Ingestion")
-        manifest = RepositoryManifest(str(repo_root), config, file_filter=files_to_include)
+        manifest = RepositoryManifest(
+            str(repo_root),
+            config,
+            file_filter=files_to_include,
+            ignore_patterns=ignore_patterns,
+        )
         cards, files = manifest.walk_repository()
         manifest.save_manifest(manifest_dir)
         bundler = AdaptiveBundler(cards, files, config)
@@ -690,7 +761,8 @@ def ingest(
     repo_path: str = typer.Argument(..., help="Path to repository to analyze"),
     output_dir: str | None = typer.Option(None, "--output", "-o", help="Output directory"),
     config_path: Path | None = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
-    file_filter: str | None = typer.Option(None, "--files", "-f", help="Comma-separated file paths"),
+    file_filter: str | None = typer.Option(None, "--files", "-f", help="Comma-separated file paths (supports glob patterns)"),
+    ignore_filter: str | None = typer.Option(None, "--ignore", "-x", help="Comma-separated glob patterns to exclude"),
     manual_chunking: bool = typer.Option(False, "--manual-chunking", help="Split files using manual markers instead of automatic chunking"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output"),
 ):
@@ -700,7 +772,8 @@ def ingest(
     
     config = load_config(config_path)
     
-    files_to_include = [f.strip() for f in file_filter.split(",")] if file_filter else None
+    files_to_include = _parse_pattern_option(file_filter)
+    ignore_patterns = _parse_pattern_option(ignore_filter)
     output_dir = Path(output_dir) if output_dir else Path(".hound_cache") / Path(repo_path).name
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -713,7 +786,9 @@ def ingest(
     ))
     
     if files_to_include and debug:
-        console.print(f"[dim]File filter: {len(files_to_include)} specific files[/dim]")
+        console.print(f"[dim]File filter patterns: {len(files_to_include)}[/dim]")
+    if ignore_patterns and debug:
+        console.print(f"[dim]Ignore patterns: {len(ignore_patterns)}[/dim]")
     
     with Progress(
         SpinnerColumn(),
@@ -724,7 +799,13 @@ def ingest(
     ) as progress:
         # Create manifest
         task1 = progress.add_task("Creating repository manifest...", total=100)
-        manifest = RepositoryManifest(repo_path, config, file_filter=files_to_include, manual_chunking=manual_chunking)
+        manifest = RepositoryManifest(
+            repo_path,
+            config,
+            file_filter=files_to_include,
+            manual_chunking=manual_chunking,
+            ignore_patterns=ignore_patterns,
+        )
         cards, files = manifest.walk_repository()
         manifest_info = manifest.save_manifest(output_dir)
         progress.update(task1, completed=100)

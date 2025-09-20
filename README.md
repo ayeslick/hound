@@ -102,7 +102,7 @@ Recommended (one‑liner):
 
 ```bash
 # Auto-generate a default set of graphs (up to 5) and refine
-# Strongly recommended: pass a whitelist of files (comma-separated)
+# Strongly recommended: pass a whitelist of files (comma-separated, glob patterns supported)
 ./hound.py graph build myaudit --auto \
   --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
 
@@ -121,7 +121,8 @@ Alternative (manual guidance):
 ./hound.py graph custom myaudit \
   "Call graph focusing on function call relationships across modules" \
   --iterations 2 \
-  --files "src/A.sol,src/B.sol,src/utils/Lib.sol"
+  --files "src/A.sol,src/B.sol,src/utils/Lib.sol" \
+  --ignore "tests/**/*.sol"
 
 # (Repeat 'graph custom' for additional targeted graphs as needed)
 ```
@@ -142,7 +143,8 @@ Whitelists (strongly recommended):
 
 - Always pass a whitelist of input files via `--files`. For the best results, the selected files should fit in the model’s available context window; whitelisting keeps the graph builder focused and avoids token overflows.
 - If you do not pass `--files`, Hound will consider all files in the repository. On large codebases this triggers sampling and may degrade coverage/quality.
-- `--files` expects a comma‑separated list of paths relative to the repo root.
+- `--files` expects a comma‑separated list of paths relative to the repo root. Glob patterns (e.g., `src/**/*.sol`) are supported.
+- Use `--ignore` to exclude paths that match comma‑separated glob patterns (e.g., generated code or tests).
 
 Examples:
 

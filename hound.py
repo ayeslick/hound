@@ -562,7 +562,8 @@ def graph_build(
     iterations: int = typer.Option(3, "--iterations", "-i", help="Maximum iterations for graph refinement"),
     graphs: int = typer.Option(5, "--graphs", "-g", help="Number of graphs to generate (ignored if --graph-spec is set)"),
     focus: str = typer.Option(None, "--focus", "-f", help="Comma-separated focus areas"),
-    files: str = typer.Option(None, "--files", help="Comma-separated list of file paths to include"),
+    files: str = typer.Option(None, "--files", help="Comma-separated list of file paths to include (supports glob patterns)"),
+    ignore: str = typer.Option(None, "--ignore", help="Comma-separated glob patterns to exclude"),
     with_spec: str = typer.Option(None, "--with-spec", help="Build exactly one graph described by this text (skips discovery for others)"),
     graph_spec: str = typer.Option(None, "--graph-spec", help="[Deprecated] Same as --with-spec"),
     refine_existing: bool = typer.Option(True, "--refine-existing/--no-refine-existing", help="Load and refine existing graphs in the project directory"),
@@ -624,6 +625,7 @@ def graph_build(
         max_graphs=graphs,
         focus_areas=focus,
         file_filter=files,
+        ignore_filter=ignore,
         with_spec=_spec,
         graph_spec=None,
         refine_existing=refine_existing,
@@ -640,7 +642,8 @@ def graph_build(
 def graph_ingest(
     target: str = typer.Argument(..., help="Project name or repository path"),
     config: str | None = typer.Option(None, "--config", "-c", help="Configuration file"),
-    files: str | None = typer.Option(None, "--files", "-f", help="Comma-separated file paths to include"),
+    files: str | None = typer.Option(None, "--files", "-f", help="Comma-separated file paths to include (supports glob patterns)"),
+    ignore: str | None = typer.Option(None, "--ignore", "-x", help="Comma-separated glob patterns to exclude"),
     manual_chunking: bool = typer.Option(False, "--manual-chunking", help="Split files using manual markers instead of automatic chunking"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output")
 ):
@@ -673,6 +676,7 @@ def graph_ingest(
         output_dir=str(output_dir),
         config_path=Path(config) if config else None,
         file_filter=files,
+        ignore_filter=ignore,
         manual_chunking=manual_chunking,
         debug=debug
     )
@@ -682,7 +686,8 @@ def graph_custom(
     project: str = typer.Argument(..., help="Project name"),
     spec: str = typer.Argument(..., help="Natural language description of the desired graph"),
     iterations: int = typer.Option(3, "--iterations", "-i", help="Refinement iterations"),
-    files: str = typer.Option(None, "--files", help="Comma-separated list of file paths to include"),
+    files: str = typer.Option(None, "--files", help="Comma-separated list of file paths to include (supports glob patterns)"),
+    ignore: str = typer.Option(None, "--ignore", help="Comma-separated glob patterns to exclude"),
     config: str = typer.Option(None, "--config", "-c", help="Configuration file"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Reduce output"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output"),
@@ -699,6 +704,7 @@ def graph_custom(
         config_path=Path(config) if config else None,
         iterations=iterations,
         file_filter=files,
+        ignore_filter=ignore,
         reuse_ingestion=True,
         debug=debug,
         quiet=quiet,
@@ -710,7 +716,8 @@ def graph_refine(
     name: str = typer.Argument(None, help="Graph name to refine (internal or display name)"),
     all: bool = typer.Option(False, "--all", help="Refine all existing graphs"),
     iterations: int = typer.Option(3, "--iterations", "-i", help="Maximum refinement iterations"),
-    files: str = typer.Option(None, "--files", help="Comma-separated list of file paths to include"),
+    files: str = typer.Option(None, "--files", help="Comma-separated list of file paths to include (supports glob patterns)"),
+    ignore: str = typer.Option(None, "--ignore", help="Comma-separated glob patterns to exclude"),
     config: str = typer.Option(None, "--config", "-c", help="Configuration file"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Reduce output"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output")
@@ -737,6 +744,7 @@ def graph_refine(
         max_graphs=1,
         focus_areas=None,
         file_filter=files,
+        ignore_filter=ignore,
         graph_spec=None,
         refine_existing=True,
         init=False,
