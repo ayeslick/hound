@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import json
+
 from .concurrent_knowledge import ConcurrentFileStore
 
 
@@ -105,17 +107,18 @@ class CoverageIndex(ConcurrentFileStore):
 
         # Collect all nodes from all graph_*.json
         total_nodes: set[str] = set()
+        graphs_path = Path(graphs_dir)
         try:
-            for gfile in Path(graphs_dir).glob('graph_*.json'):
-                import json as _json
+            for gfile in graphs_path.glob('graph_*.json'):
                 try:
-                    gd = _json.loads(Path(gfile).read_text())
-                    for n in gd.get('nodes', []) or []:
-                        nid = n.get('id')
-                        if nid:
-                            total_nodes.add(str(nid))
+                    with gfile.open(encoding='utf-8') as f:
+                        gd = json.load(f)
                 except Exception:
                     continue
+                for n in gd.get('nodes', []) or []:
+                    nid = n.get('id')
+                    if nid:
+                        total_nodes.add(str(nid))
         except Exception:
             pass
 
@@ -123,31 +126,34 @@ class CoverageIndex(ConcurrentFileStore):
 
         # Collect total cards
         total_cards: set[str] = set()
-        card_store = Path(graphs_dir) / 'card_store.json'
+        card_store = graphs_path / 'card_store.json'
         if card_store.exists():
             try:
-                import json as _json
-                store = _json.loads(card_store.read_text())
+                with card_store.open(encoding='utf-8') as f:
+                    store = json.load(f)
                 if isinstance(store, dict):
-                    total_cards.update([str(k) for k in store.keys()])
+                    total_cards.update(str(k) for k in store.keys())
             except Exception:
                 pass
         else:
-            cards_jsonl = Path(manifest_dir) / 'cards.jsonl'
+            manifest_path = Path(manifest_dir)
+            cards_jsonl = manifest_path / 'cards.jsonl'
             if cards_jsonl.exists():
                 try:
-                    for line in cards_jsonl.read_text().splitlines():
-                        try:
-                            import json as _json
-                            cd = _json.loads(line)
+                    with cards_jsonl.open(encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                cd = json.loads(line)
+                            except Exception:
+                                continue
                             cid = cd.get('id')
                             if cid:
                                 total_cards.add(str(cid))
-                        except Exception:
-                            continue
                 except Exception:
                     pass
-
         visited_cards = set((data.get('cards') or {}).keys())
 
         def pct(x: int, y: int) -> float:

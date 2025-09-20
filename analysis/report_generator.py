@@ -49,53 +49,92 @@ class ReportGenerator:
         self._code_block_counter: int = 0
 
     def _load_card_store_and_repo_root(self) -> None:
-        """Load card_store.json (graph evidence) and determine repo root.
+        """Load card store metadata and repo root details from disk.
 
-        Prefers using graphs/knowledge_graphs.json metadata to locate the
-        card store and repo path. Falls back silently if not present.
+        The metadata produced by the graph builder may reference resources
+        using either absolute or relative paths depending on where the
+        project was created. We normalise those references here so the report
+        generator keeps working even when the project directory is moved to a
+        new location.
         """
-        try:
-            graphs_dir = self.project_dir / "graphs"
-            kg_path = graphs_dir / "knowledge_graphs.json"
-            if kg_path.exists():
-                with open(kg_path) as f:
-                    kg = json.load(f)
-                # Repo root from manifest
-                manifest = kg.get('manifest') or {}
-                rp = manifest.get('repo_path')
-                if rp:
-                    try:
-                        self.repo_root = Path(rp)
-                    except Exception:
-                        self.repo_root = None
-                # Card store
-                card_store_path = kg.get('card_store_path')
-                if card_store_path:
-                    try:
-                        with open(card_store_path) as f:
-                            store = json.load(f)
-                        if isinstance(store, dict):
-                            self.card_store = store
-                    except Exception:
-                        # Try local graphs dir fallback
-                        csp = graphs_dir / "card_store.json"
-                        if csp.exists():
-                            with open(csp) as f2:
-                                store = json.load(f2)
-                            if isinstance(store, dict):
-                                self.card_store = store
+
+        graphs_dir = self.project_dir / "graphs"
+        kg_path = graphs_dir / "knowledge_graphs.json"
+
+        def _load_json_dict(path: Path) -> dict[str, Any] | None:
+            """Best-effort loader that only returns dict payloads."""
+
+            try:
+                if not path.exists():
+                    return None
+                with path.open(encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else None
+            except Exception:
+                return None
+
+        kg_data = _load_json_dict(kg_path)
+
+        # Resolve repository root from manifest metadata when available.
+        if isinstance(kg_data, dict):
+            manifest = kg_data.get("manifest")
+            repo_path = manifest.get("repo_path") if isinstance(manifest, dict) else None
+            if isinstance(repo_path, str) and repo_path.strip():
+                candidate = Path(repo_path.strip())
+                if not candidate.is_absolute():
+                    candidate = (self.project_dir / candidate).resolve()
+                self.repo_root = candidate
+
+        # Determine possible card store locations.
+        candidates: list[Path] = []
+
+        def _add_candidate(raw: str) -> None:
+            base = Path(raw)
+            if base.is_absolute():
+                candidates.append(base)
             else:
-                # Try direct card_store.json
-                csp = self.project_dir / "graphs" / "card_store.json"
-                if csp.exists():
-                    with open(csp) as f3:
-                        store = json.load(f3)
-                    if isinstance(store, dict):
-                        self.card_store = store
-        except Exception:
-            # Leave empty on failure; fallback logic will handle
-            if self.debug:
-                print("[!] Failed to load card store or repo root")
+                candidates.append(graphs_dir / base)
+                candidates.append(self.project_dir / base)
+                candidates.append(base)
+
+        if isinstance(kg_data, dict):
+            raw_path = kg_data.get("card_store_path")
+            if isinstance(raw_path, str) and raw_path.strip():
+                _add_candidate(raw_path.strip())
+
+        # Always check the default location inside graphs/ as a fallback.
+        candidates.append(graphs_dir / "card_store.json")
+
+        # Deduplicate while preserving order.
+        unique_candidates: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append(candidate)
+
+        for candidate in unique_candidates:
+            store = _load_json_dict(candidate)
+            if store is not None:
+                self.card_store = store
+                break
+
+        # If we still do not have a repo root try to fall back gracefully.
+        if self.repo_root is None and isinstance(kg_data, dict):
+            manifest = kg_data.get("manifest")
+            repo_path = manifest.get("repo_path") if isinstance(manifest, dict) else None
+            if isinstance(repo_path, str) and repo_path.strip():
+                try:
+                    self.repo_root = Path(repo_path.strip())
+                except Exception:
+                    pass
+
+        if self.card_store or self.repo_root is not None or not self.debug:
+            return
+
+        # Only warn in debug mode when nothing could be loaded.
+        print("[!] Failed to load card store or repo root")
     
     def _load_graphs(self) -> dict[str, Any]:
         """Load all graphs from project."""
