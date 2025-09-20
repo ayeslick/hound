@@ -115,10 +115,15 @@ class Strategist:
 
     def plan_next(self, *, graphs_summary: str, completed: list[str], n: int = 5,
                   hypotheses_summary: str | None = None, coverage_summary: str | None = None,
-                  ledger_summary: str | None = None, phase_hint: str | None = None) -> list[dict[str, Any]]:
+                  ledger_summary: str | None = None, phase_hint: str | None = None,
+                  coverage_data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Plan the next n investigations from comprehensive audit context.
 
         Returns a list of dicts compatible with downstream display and PlanStore.
+
+        When ``coverage_data`` contains card-aware metrics, the strategist will
+        inject coverage top-up items during Saliency mode to close remaining
+        gaps before exploring new intuition leads.
 
         Prompt design notes (simple and commented for clarity):
         - Planning should start broad (aspect frames) then home in (suspicions) as evidence accumulates.
@@ -294,13 +299,94 @@ class Strategist:
                 "category": it.category,
                 "expected_impact": it.expected_impact,
             })
-        # DISABLED: Coverage top-up removed because we don't have card count information
-        # To properly implement this, we would need:
-        # 1. Number of code cards per node
-        # 2. Number of visited cards per node
-        # Then we could prioritize nodes with many unvisited cards
-        pass
-        return items
+        def _coverage_priority(unvisited: int, total: int) -> int:
+            """Map remaining card count to a priority score."""
+
+            if total > 0:
+                ratio = unvisited / total
+            else:
+                ratio = 0.0
+            if unvisited >= 10 or ratio >= 0.75:
+                return 9
+            if unvisited >= 6 or ratio >= 0.5:
+                return 8
+            if unvisited >= 3 or ratio >= 0.3:
+                return 7
+            return 6
+
+        if str(phase_hint or '').lower() == 'saliency' and coverage_data:
+            node_graph_map = coverage_data.get('node_graph_map') or {}
+            top_nodes = coverage_data.get('top_unvisited_nodes') or []
+            if not top_nodes:
+                top_nodes = [
+                    entry for entry in (coverage_data.get('node_card_summary') or [])
+                    if entry.get('unvisited_cards', 0) > 0
+                ]
+
+            existing_focus_nodes: set[str] = set()
+            existing_focus_areas: set[str] = set()
+            for planned in items:
+                for focus in planned.get('focus_areas') or []:
+                    focus_str = str(focus)
+                    existing_focus_areas.add(focus_str)
+                    node_part = focus_str.split('@')[0].strip()
+                    if node_part:
+                        existing_focus_nodes.add(node_part)
+
+            coverage_items: list[dict[str, Any]] = []
+            for entry in top_nodes:
+                node_id = str(entry.get('node_id') or '')
+                total_cards = int(entry.get('total_cards') or 0)
+                unvisited_cards = int(entry.get('unvisited_cards') or 0)
+                if not node_id or total_cards <= 0 or unvisited_cards <= 0:
+                    continue
+                if node_id in existing_focus_nodes:
+                    continue
+                graph_name = node_graph_map.get(node_id)
+                focus_area = f"{node_id}@{graph_name}" if graph_name else node_id
+                if focus_area in existing_focus_areas:
+                    continue
+
+                priority = _coverage_priority(unvisited_cards, total_cards)
+                reasoning = (
+                    f"Coverage gap: {unvisited_cards}/{total_cards} cards for {node_id} remain unanalyzed. "
+                    "Close this component before pursuing new high-impact intuition targets."
+                )
+                coverage_items.append({
+                    "goal": f"Coverage top-up: complete review of {node_id}",
+                    "focus_areas": [focus_area],
+                    "priority": priority,
+                    "reasoning": reasoning,
+                    "category": "aspect",
+                    "expected_impact": "medium",
+                })
+                existing_focus_nodes.add(node_id)
+                existing_focus_areas.add(focus_area)
+                if len(coverage_items) >= n:
+                    break
+
+            if coverage_items:
+                combined = coverage_items + items
+                deduped: list[dict[str, Any]] = []
+                seen_focus: set[tuple[str, ...]] = set()
+                seen_goals: set[str] = set()
+                for candidate in combined:
+                    focus_key = tuple(sorted(candidate.get('focus_areas') or []))
+                    goal_key = (candidate.get('goal') or '').strip().lower()
+                    if focus_key and focus_key in seen_focus:
+                        continue
+                    if goal_key and goal_key in seen_goals:
+                        continue
+                    if focus_key:
+                        seen_focus.add(focus_key)
+                    if goal_key:
+                        seen_goals.add(goal_key)
+                    deduped.append(candidate)
+                    if len(deduped) >= n:
+                        break
+                items = deduped
+
+        return items[:n]
 
     def revise_after(self, last_result: dict[str, Any]) -> None:
         return None

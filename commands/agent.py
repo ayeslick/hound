@@ -1261,55 +1261,67 @@ class AgentRunner:
         cov_stats = None
         if self.session_tracker:
             cov_stats = self.session_tracker.get_coverage_stats()
-            coverage_summary = (
-                f"Nodes visited: {cov_stats['nodes']['visited']}/{cov_stats['nodes']['total']} "
-                f"({cov_stats['nodes']['percent']:.1f}%)\n"
-                f"Cards analyzed: {cov_stats['cards']['visited']}/{cov_stats['cards']['total']} "
-                f"({cov_stats['cards']['percent']:.1f}%)"
-            )
-            if cov_stats['visited_node_ids']:
+            coverage_lines = [
+                (
+                    f"Nodes visited: {cov_stats['nodes']['visited']}/{cov_stats['nodes']['total']} "
+                    f"({cov_stats['nodes']['percent']:.1f}%)"
+                ),
+                (
+                    f"Cards analyzed: {cov_stats['cards']['visited']}/{cov_stats['cards']['total']} "
+                    f"({cov_stats['cards']['percent']:.1f}%)"
+                ),
+            ]
+
+            node_graph_map = cov_stats.get('node_graph_map') or {}
+            top_unvisited = [
+                entry for entry in (cov_stats.get('top_unvisited_nodes') or [])
+                if entry.get('unvisited_cards', 0) > 0
+            ]
+
+            if top_unvisited:
+                coverage_lines.append("Top coverage gaps (remaining cards):")
+                for entry in top_unvisited[:5]:
+                    node_id = entry.get('node_id')
+                    if not node_id:
+                        continue
+                    graph_name = node_graph_map.get(node_id)
+                    label = f"{node_id}@{graph_name}" if graph_name else node_id
+                    coverage_lines.append(
+                        f"- {label}: {entry.get('unvisited_cards', 0)} of {entry.get('total_cards', 0)} cards pending "
+                        f"({entry.get('coverage_percent', 0.0):.1f}% covered)"
+                    )
+            elif cov_stats.get('node_card_summary'):
+                coverage_lines.append("All tracked components have full card coverage.")
+            else:
+                coverage_lines.append("Card-level artifact data unavailable; falling back to node coverage sample.")
                 try:
-                    annotated_visited = self._annotate_nodes_with_graph(cov_stats['visited_node_ids'][:10])
-                    coverage_summary += f"\nVisited nodes: {', '.join(annotated_visited)}"
-                except Exception:
-                    coverage_summary += f"\nVisited nodes: {', '.join(cov_stats['visited_node_ids'][:10])}"
-                if len(cov_stats['visited_node_ids']) > 10:
-                    coverage_summary += f" ... and {len(cov_stats['visited_node_ids']) - 10} more"
-            # Append a concise list of unvisited node IDs to guide coverage
-            try:
-                unvisited_sample, unvisited_count = self._get_unvisited_nodes_sample(max_n=15)
-                if unvisited_count > 0 and unvisited_sample:
-                    try:
-                        annotated_unvisited = self._annotate_nodes_with_graph(unvisited_sample[:10])
-                        sample_str = ', '.join(annotated_unvisited)
-                    except Exception:
-                        sample_str = ', '.join(unvisited_sample[:10])
-                    coverage_summary += f"\nUnvisited nodes: {unvisited_count} (sample: {sample_str}{'' if len(unvisited_sample) <= 10 else ', ...'})"
-                # Also show unvisited high-level components (contracts/modules/services/files)
-                try:
-                    sys_graph = (self.agent.loaded_data or {}).get('system_graph') or {}
-                    gdata = sys_graph.get('data') or {}
-                    nodes = gdata.get('nodes') or []
-                    edges = gdata.get('edges') or []
-                    comp_nodes = _high_level_nodes(nodes, edges)
-                    visited_ids = set(cov_stats.get('visited_node_ids') or [])
-                    unv_comp = [node for node in comp_nodes if str(node.get('id') or '') not in visited_ids]
-                    if unv_comp:
-                        samp = [f"{(node.get('id') or '')}@SystemArchitecture" for node in unv_comp[:10] if node.get('id')]
-                        coverage_summary += f"\nUnvisited components: {len(unv_comp)} (sample: {', '.join(samp)}{'' if len(unv_comp) <= 10 else ', ...'})"
-                        # Add a structured candidate list to guide planner selection
-                        lines = []
-                        for node in unv_comp[:10]:
-                            nid = str(node.get('id') or '')
-                            lbl = str(node.get('label') or nid)
-                            if nid:
-                                lines.append(f"- {lbl} ({nid})")
-                        if lines:
-                            coverage_summary += "\nCANDIDATE COMPONENTS (unvisited):\n" + "\n".join(lines)
+                    unvisited_sample, unvisited_count = self._get_unvisited_nodes_sample(max_n=15)
+                    if unvisited_count > 0 and unvisited_sample:
+                        try:
+                            annotated_unvisited = self._annotate_nodes_with_graph(unvisited_sample[:10])
+                            sample_str = ', '.join(annotated_unvisited)
+                        except Exception:
+                            sample_str = ', '.join(unvisited_sample[:10])
+                        coverage_lines.append(
+                            f"Unvisited nodes: {unvisited_count} (sample: {sample_str}{'' if len(unvisited_sample) <= 10 else ', ...'})"
+                        )
                 except Exception:
                     pass
-            except Exception:
-                pass
+
+            fully_covered = cov_stats.get('fully_covered_nodes') or []
+            if fully_covered:
+                coverage_lines.append("Fully analyzed components:")
+                for entry in fully_covered[:5]:
+                    node_id = entry.get('node_id')
+                    if not node_id:
+                        continue
+                    graph_name = node_graph_map.get(node_id)
+                    label = f"{node_id}@{graph_name}" if graph_name else node_id
+                    coverage_lines.append(
+                        f"- {label}: {entry.get('total_cards', 0)} cards (complete)"
+                    )
+
+            coverage_summary = "\n".join(coverage_lines)
 
         # Determine phase (Coverage/Saliency) from mode flag or coverage
         def _determine_phase_two(cov: dict | None) -> str:
@@ -1398,6 +1410,7 @@ class AgentRunner:
                 completed=investigation_results,
                 hypotheses_summary=hypotheses_summary,
                 coverage_summary=coverage_summary,
+                coverage_data=cov_stats,
                 n=rem,
                 phase_hint=self._current_phase
             ) or []
@@ -1665,18 +1678,44 @@ class AgentRunner:
         # Compact coverage line
         if self.session_tracker:
             cov = self.session_tracker.get_coverage_stats()
-            try:
-                sample, count = self._get_unvisited_nodes_sample(max_n=5)
-                if count > 0 and sample:
-                    sample = self._annotate_nodes_with_graph(sample)
-            except Exception:
-                sample, count = ([], 0)
+            node_graph_map = cov.get('node_graph_map') or {}
+            top_nodes_for_status = cov.get('top_unvisited_nodes') or []
+            gap_samples: list[str] = []
+            for entry in top_nodes_for_status[:3]:
+                try:
+                    node_id = entry.get('node_id')
+                    unv = entry.get('unvisited_cards', 0)
+                    total = entry.get('total_cards', 0)
+                    if not node_id or not unv:
+                        continue
+                    graph_name = node_graph_map.get(node_id)
+                    label = f"{node_id}@{graph_name}" if graph_name else node_id
+                    gap_samples.append(f"{label} ({unv}/{total})")
+                except Exception:
+                    continue
+            if not gap_samples:
+                try:
+                    sample, count = self._get_unvisited_nodes_sample(max_n=5)
+                    if count > 0 and sample:
+                        sample = self._annotate_nodes_with_graph(sample)
+                        gap_samples = [f"{s}" for s in sample]
+                        count_remaining = count
+                    else:
+                        count_remaining = 0
+                except Exception:
+                    gap_samples = []
+                    count_remaining = 0
+            else:
+                count_remaining = sum(entry.get('unvisited_cards', 0) for entry in top_nodes_for_status)
             line = (
                 f"Coverage: Nodes {cov['nodes']['visited']}/{cov['nodes']['total']} ({cov['nodes']['percent']:.1f}%) | "
                 f"Cards {cov['cards']['visited']}/{cov['cards']['total']} ({cov['cards']['percent']:.1f}%)"
             )
-            if count > 0 and sample:
-                line += f" | Unvisited: {count} (sample: {', '.join(sample)})"
+            if gap_samples:
+                if top_nodes_for_status:
+                    line += f" | Coverage gaps: {', '.join(gap_samples)}"
+                else:
+                    line += f" | Unvisited: {count_remaining} (sample: {', '.join(gap_samples)})"
             console.print("\n" + line)
         else:
             console.print("\nCoverage: [dim]Not available[/dim]")
