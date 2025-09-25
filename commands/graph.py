@@ -286,6 +286,14 @@ def build(
                     ignore_patterns=ignore_patterns,
                 )
                 cards, files = manifest.walk_repository()
+                if not files:
+                    console.print(
+                        f"[red]Error: Repository manifest contained no files under {repo_path}.[/red]"
+                    )
+                    console.print(
+                        "[yellow]Tip: Check or update the project's source_path if the repository moved or is empty.[/yellow]"
+                    )
+                    raise typer.Exit(code=2)
                 manifest.save_manifest(manifest_dir)
                 log_line('ingest', f"Ingested {len(files)} files → {len(cards)} cards")
                 bundler = AdaptiveBundler(cards, files, config)
@@ -654,6 +662,14 @@ def custom(
             ignore_patterns=ignore_patterns,
         )
         cards, files = manifest.walk_repository()
+        if not files:
+            console.print(
+                f"[red]Error: Repository manifest contained no files under {repo_root}.[/red]"
+            )
+            console.print(
+                "[yellow]Tip: Check or update the project's source_path if the repository moved or is empty.[/yellow]"
+            )
+            raise typer.Exit(code=2)
         manifest.save_manifest(manifest_dir)
         bundler = AdaptiveBundler(cards, files, config)
         bundler.create_bundles()
