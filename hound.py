@@ -185,6 +185,17 @@ def project_delete(
     from commands.project import delete
     _invoke_click(delete, {'name': name, 'force': force})
 
+
+@project_app.command("set-source")
+def project_set_source(
+    name: str = typer.Argument(..., help="Project name"),
+    source_path: str = typer.Argument(..., help="New source path")
+):
+    """Update a project's source path."""
+
+    from commands.project import set_source
+    _invoke_click(set_source, {'name': name, 'source_path': source_path})
+
 @project_app.command("rm")
 def project_rm(
     name: str = typer.Argument(..., help="Project name"),

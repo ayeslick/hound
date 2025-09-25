@@ -320,6 +320,46 @@ class ProjectManager:
             return Path(project["path"])
         return None
 
+    def update_source_path(self, name: str, new_source_path: str) -> dict:
+        """Update the source path for an existing project."""
+
+        candidate_path = Path(new_source_path).expanduser().resolve()
+        if not candidate_path.exists():
+            raise ValueError(f"Source path does not exist: {candidate_path}")
+
+        project = self.get_project(name)
+        if not project:
+            raise ValueError(f"Project '{name}' not found")
+
+        project_dir = Path(project["path"])
+        config_file = project_dir / "project.json"
+        if not config_file.exists():
+            raise ValueError(f"Project configuration missing for '{name}'")
+
+        try:
+            with open(config_file, encoding="utf-8") as fh:
+                config = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Project configuration for '{name}' is corrupted") from exc
+
+        config["source_path"] = str(candidate_path)
+
+        with open(config_file, "w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2)
+
+        registry = self._load_registry()
+        project_entry = registry.setdefault("projects", {}).setdefault(name, {})
+        project_entry["path"] = str(project_dir)
+        project_entry["source_path"] = str(candidate_path)
+        if "created_at" not in project_entry and "created_at" in config:
+            project_entry["created_at"] = config["created_at"]
+        if "description" not in project_entry and "description" in config:
+            project_entry["description"] = config["description"]
+        self._save_registry(registry)
+
+        config["path"] = str(project_dir)
+        return config
+
 
 # CLI Commands
 
@@ -376,6 +416,33 @@ def create(name: str, source_path: str, description: str | None, auto_name: bool
         # Print errors to stderr so callers can capture them reliably
         click.echo(f"Error: {str(e)}", err=True)
         raise click.Exit(1)
+
+
+@project.command(name='set-source')
+@click.argument('name')
+@click.argument('source_path')
+def set_source(name: str, source_path: str):
+    """Update the source path for an existing project."""
+
+    manager = ProjectManager()
+    try:
+        updated = manager.update_source_path(name, source_path)
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise click.Exit(1)
+
+    reminder = (
+        f"[dim]Reminder: re-run ingestion so cached manifests match the new source "
+        f"path (e.g., `hound graph build --project {name} --auto`).[/dim]"
+    )
+    console.print(Panel(
+        f"[bright_green]✓ Source path updated[/bright_green]\n\n"
+        f"[bold]Project:[/bold] {name}\n"
+        f"[bold]New source:[/bold] {updated['source_path']}\n\n"
+        f"{reminder}",
+        title="[bold bright_cyan]Project Updated[/bold bright_cyan]",
+        border_style="bright_green",
+    ))
 
 
 @project.command(name='list')
